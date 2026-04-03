@@ -11,6 +11,7 @@ It can:
 - Combine the images into PDF files
 - Apply a built-in cooldown between chapter downloads
 - Retry failed chapter downloads automatically
+- Fall back to Chromium for chapters that hide reader images from direct requests
 
 ## Credits
 
@@ -22,6 +23,8 @@ It can:
 
 - Python 3.10 or newer
 - Internet connection
+- `chromium-browser`, `chromium`, or `google-chrome` if a site only exposes chapter images after real browser rendering
+- `browser-cookie3` support is included via `requirements.txt` so MangaSnatcher can reuse login cookies from Brave/Chrome/Chromium/Firefox
 
 Python dependencies:
 
@@ -87,6 +90,20 @@ You can set a custom output folder with:
 ```bash
 python MangaSnatcher.py "https://www.mangaread.org/manga/example-series/" --output my_pdfs
 ```
+
+If a chapter page hides its reader images from normal HTTP requests, MangaSnatcher automatically falls back to Chromium and reads the rendered DOM instead. On Linux, this requires a graphical session. You can disable that behavior with:
+
+```bash
+python MangaSnatcher.py "https://www.mangaread.org/manga/example-series/" --no-browser-fallback
+```
+
+If the site only serves chapter images to your logged-in browser session, MangaSnatcher can also import cookies from your local browser profile:
+
+```bash
+python MangaSnatcher.py "https://www.mangaread.org/manga/example-series/" --browser-cookies brave
+```
+
+Supported values are `auto`, `brave`, `chrome`, `chromium`, `firefox`, and `none`.
 
 ## How It Works
 

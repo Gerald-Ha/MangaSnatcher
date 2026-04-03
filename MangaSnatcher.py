@@ -3,20 +3,30 @@
 Developer: Gerald-H
 GitHub: https://github.com/Gerald-Ha
 Project: MangaSnatcher
+Version: 2.0
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import json
+import os
 import re
+import shutil
+import socket
+import struct
+import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib.parse import urljoin, urlparse
+from urllib.request import urlopen
 
 import requests
 from bs4 import BeautifulSoup
@@ -28,7 +38,27 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_CHAPTER_COOLDOWN = 3
 RETRY_CHAPTER_COOLDOWN = 8
 ERROR_RETRY_DELAY = 60
+BROWSER_STARTUP_TIMEOUT = 10
+BROWSER_RENDER_TIMEOUT = 20
+BROWSER_POLL_INTERVAL = 0.5
 CHAPTER_URL_RE = re.compile(r"/chapter-(\d+)/?$", re.IGNORECASE)
+CHROMIUM_CANDIDATES = (
+    "brave-browser",
+    "brave",
+    "chromium-browser",
+    "chromium",
+    "google-chrome",
+)
+BROWSER_COOKIE_DOMAIN = "www.mangaread.org"
+BROWSER_COOKIE_CANDIDATES = ("brave", "chrome", "chromium", "firefox")
+RENDERED_IMAGE_QUERY = """
+(() => Array.from(
+    document.querySelectorAll('.reading-content img.wp-manga-chapter-img, .reading-content img')
+).map((img) => img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.getAttribute('src'))
+ .filter(Boolean))()
+""".strip()
+
+BrowserImageFetcher = Callable[[str], list[str]]
 
 
 @dataclass(frozen=True)
@@ -152,23 +182,461 @@ def parse_chapter_images(html: str, chapter_url: str) -> list[str]:
         "img.wp-manga-chapter-img"
     )
 
+    return normalize_image_sources(
+        (
+            first_non_empty(
+                image.get("data-src"),
+                image.get("data-lazy-src"),
+                image.get("src"),
+            )
+            for image in soup.select(selectors)
+        ),
+        chapter_url,
+    )
+
+
+def has_reader_markup(html: str) -> bool:
+    lowered = html.lower()
+    return any(
+        marker in lowered
+        for marker in ("wp-manga-current-chap", "wp-manga-chapter-img", "page-break")
+    )
+
+
+def normalize_image_sources(sources: Iterable[str | None], chapter_url: str) -> list[str]:
     images: list[str] = []
     seen: set[str] = set()
-    for image in soup.select(selectors):
-        source = first_non_empty(
-            image.get("data-src"),
-            image.get("data-lazy-src"),
-            image.get("src"),
-        )
+    for source in sources:
         if not source:
             continue
-        source = re.sub(r"\s+", "", source)
-        absolute_source = urljoin(chapter_url, source)
+        cleaned_source = re.sub(r"\s+", "", source)
+        absolute_source = urljoin(chapter_url, cleaned_source)
         if absolute_source in seen:
             continue
         seen.add(absolute_source)
         images.append(absolute_source)
     return images
+
+
+def find_chromium_executable() -> str | None:
+    for candidate in CHROMIUM_CANDIDATES:
+        executable = shutil.which(candidate)
+        if executable:
+            return executable
+    return None
+
+
+def import_browser_cookie_module():
+    try:
+        import browser_cookie3  # type: ignore
+    except ModuleNotFoundError:
+        return None
+    return browser_cookie3
+
+
+def session_has_domain_cookie(session: requests.Session, domain: str) -> bool:
+    normalized_domain = domain.lstrip(".")
+    for cookie in session.cookies:
+        cookie_domain = cookie.domain.lstrip(".")
+        if (
+            cookie_domain == normalized_domain
+            or cookie_domain.endswith(f".{normalized_domain}")
+            or normalized_domain.endswith(f".{cookie_domain}")
+        ):
+            return True
+    return False
+
+
+def add_cookiejar_to_session(session: requests.Session, cookiejar) -> int:
+    added = 0
+    for cookie in cookiejar:
+        session.cookies.set_cookie(cookie)
+        added += 1
+    return added
+
+
+def load_browser_cookies_into_session(
+    session: requests.Session,
+    browser_name: str = "auto",
+    domain_name: str = BROWSER_COOKIE_DOMAIN,
+) -> str | None:
+    browser_cookie3 = import_browser_cookie_module()
+    if browser_cookie3 is None:
+        return None
+
+    if browser_name == "none":
+        return None
+
+    candidate_names = (
+        list(BROWSER_COOKIE_CANDIDATES)
+        if browser_name == "auto"
+        else [browser_name]
+    )
+
+    for candidate_name in candidate_names:
+        loader = getattr(browser_cookie3, candidate_name, None)
+        if loader is None:
+            continue
+        try:
+            cookiejar = loader(domain_name=domain_name)
+        except Exception:
+            continue
+        added = add_cookiejar_to_session(session, cookiejar)
+        if added > 0 and session_has_domain_cookie(session, domain_name):
+            return candidate_name
+
+    return None
+
+
+def reserve_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
+
+
+class ChromeDevToolsClient:
+    def __init__(self, websocket_url: str, timeout: int) -> None:
+        self.websocket_url = websocket_url
+        self.timeout = timeout
+        self.socket: socket.socket | None = None
+        self._next_id = 0
+        self._read_buffer = bytearray()
+
+    def __enter__(self) -> ChromeDevToolsClient:
+        self.socket = self._connect()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.socket is None:
+            return
+        try:
+            self._send_frame("", opcode=0x8)
+        except OSError:
+            pass
+        self.socket.close()
+        self.socket = None
+
+    def call(self, method: str, params: dict | None = None) -> dict:
+        self._next_id += 1
+        message_id = self._next_id
+        payload = {"id": message_id, "method": method}
+        if params:
+            payload["params"] = params
+        self._send_json(payload)
+
+        while True:
+            message = self._receive_json()
+            if message.get("id") != message_id:
+                continue
+            if "error" in message:
+                raise RuntimeError(f"Chrome DevTools error for {method}: {message['error']}")
+            return message.get("result", {})
+
+    def evaluate(self, expression: str) -> object:
+        result = self.call(
+            "Runtime.evaluate",
+            {"expression": expression, "returnByValue": True},
+        )
+        return result.get("result", {}).get("value")
+
+    def _connect(self) -> socket.socket:
+        parsed = urlparse(self.websocket_url)
+        if parsed.scheme != "ws":
+            raise RuntimeError(f"Unsupported DevTools websocket scheme: {parsed.scheme}")
+
+        sock = socket.create_connection(
+            (parsed.hostname or "127.0.0.1", parsed.port or 80),
+            timeout=self.timeout,
+        )
+        sock.settimeout(self.timeout)
+
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {parsed.hostname}:{parsed.port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        sock.sendall(request.encode("ascii"))
+
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("Chrome DevTools websocket closed during handshake.")
+            response += chunk
+
+        header_bytes, remainder = response.split(b"\r\n\r\n", 1)
+        self._read_buffer.extend(remainder)
+        header_text = header_bytes.decode("utf-8", errors="replace")
+        status_line, headers = self._parse_http_headers(header_text)
+        status_parts = status_line.split()
+        if len(status_parts) < 2 or status_parts[1] != "101":
+            raise RuntimeError(f"Chrome DevTools handshake failed: {header_text}")
+
+        expected_accept = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+        ).decode("ascii")
+        actual_accept = headers.get("sec-websocket-accept", "")
+        if actual_accept != expected_accept:
+            raise RuntimeError("Chrome DevTools handshake returned an unexpected accept key.")
+
+        return sock
+
+    @staticmethod
+    def _parse_http_headers(header_text: str) -> tuple[str, dict[str, str]]:
+        lines = [line for line in header_text.split("\r\n") if line]
+        if not lines:
+            raise RuntimeError("Chrome DevTools handshake returned an empty response.")
+
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+        return lines[0], headers
+
+    def _send_json(self, payload: dict) -> None:
+        self._send_frame(json.dumps(payload), opcode=0x1)
+
+    def _send_frame(self, payload: str, opcode: int) -> None:
+        if self.socket is None:
+            raise RuntimeError("Chrome DevTools socket is not connected.")
+
+        encoded = payload.encode("utf-8")
+        frame = bytearray()
+        frame.append(0x80 | opcode)
+
+        payload_length = len(encoded)
+        if payload_length < 126:
+            frame.append(0x80 | payload_length)
+        elif payload_length < 65536:
+            frame.append(0x80 | 126)
+            frame.extend(struct.pack("!H", payload_length))
+        else:
+            frame.append(0x80 | 127)
+            frame.extend(struct.pack("!Q", payload_length))
+
+        mask = os.urandom(4)
+        frame.extend(mask)
+        frame.extend(byte ^ mask[index % 4] for index, byte in enumerate(encoded))
+        self.socket.sendall(frame)
+
+    def _receive_json(self) -> dict:
+        while True:
+            opcode, payload = self._receive_frame()
+            if opcode == 0x1:
+                return json.loads(payload.decode("utf-8"))
+            if opcode == 0x8:
+                raise RuntimeError("Chrome DevTools websocket closed unexpectedly.")
+            if opcode == 0x9:
+                self._send_frame(payload.decode("utf-8", errors="ignore"), opcode=0xA)
+
+    def _receive_frame(self) -> tuple[int, bytes]:
+        if self.socket is None:
+            raise RuntimeError("Chrome DevTools socket is not connected.")
+
+        first_byte, second_byte = self._read_exactly(2)
+        opcode = first_byte & 0x0F
+        masked = bool(second_byte & 0x80)
+        payload_length = second_byte & 0x7F
+
+        if payload_length == 126:
+            payload_length = struct.unpack("!H", self._read_exactly(2))[0]
+        elif payload_length == 127:
+            payload_length = struct.unpack("!Q", self._read_exactly(8))[0]
+
+        mask = self._read_exactly(4) if masked else b""
+        payload = self._read_exactly(payload_length)
+        if masked:
+            payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        return opcode, payload
+
+    def _read_exactly(self, size: int) -> bytes:
+        if self.socket is None:
+            raise RuntimeError("Chrome DevTools socket is not connected.")
+
+        chunks = bytearray()
+        if self._read_buffer:
+            buffered = self._read_buffer[:size]
+            chunks.extend(buffered)
+            del self._read_buffer[: len(buffered)]
+        while len(chunks) < size:
+            chunk = self.socket.recv(size - len(chunks))
+            if not chunk:
+                raise RuntimeError("Chrome DevTools websocket closed unexpectedly.")
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+
+def wait_for_debugger_target(
+    port: int,
+    browser_process: subprocess.Popen[str],
+    timeout: int,
+    target_url: str | None = None,
+) -> str:
+    debugger_url = f"http://127.0.0.1:{port}/json/list"
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        if browser_process.poll() is not None:
+            stderr_output = ""
+            if browser_process.stderr is not None:
+                stderr_output = browser_process.stderr.read().strip()
+            raise RuntimeError(
+                "Chromium exited before the DevTools endpoint became available. "
+                f"{stderr_output or 'No stderr output was captured.'}"
+            )
+
+        try:
+            with urlopen(debugger_url, timeout=1) as response:
+                targets = json.load(response)
+        except OSError:
+            time.sleep(0.2)
+            continue
+
+        matching_page_url: str | None = None
+        for target in targets:
+            websocket_url = target.get("webSocketDebuggerUrl")
+            page_url = str(target.get("url") or "")
+            if target.get("type") != "page" or not websocket_url:
+                continue
+            if target_url and page_url.startswith(target_url):
+                return str(websocket_url)
+            if page_url and page_url != "about:blank" and matching_page_url is None:
+                matching_page_url = str(websocket_url)
+        if matching_page_url:
+            return matching_page_url
+        time.sleep(0.2)
+
+    raise RuntimeError("Timed out while waiting for Chromium DevTools to become available.")
+
+
+def close_browser_process(browser_process: subprocess.Popen[str]) -> None:
+    if browser_process.poll() is None:
+        browser_process.terminate()
+        try:
+            browser_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            browser_process.kill()
+            browser_process.wait(timeout=10)
+    if browser_process.stderr is not None:
+        browser_process.stderr.close()
+
+
+def cleanup_browser_profile(user_data_dir: str) -> None:
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            shutil.rmtree(user_data_dir)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                shutil.rmtree(user_data_dir, ignore_errors=True)
+                return
+            time.sleep(0.5)
+
+
+def fetch_chapter_images_with_browser(chapter_url: str) -> list[str]:
+    chromium_executable = find_chromium_executable()
+    if not chromium_executable:
+        raise RuntimeError("Chromium is not installed, so browser fallback is unavailable.")
+
+    if sys.platform.startswith("linux") and not (
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    ):
+        raise RuntimeError(
+            "Browser fallback requires a graphical session on Linux "
+            "(missing DISPLAY or WAYLAND_DISPLAY)."
+        )
+
+    debug_port = reserve_local_port()
+    user_data_dir = tempfile.mkdtemp(prefix="manga_snatcher_chromium_")
+
+    browser_process = subprocess.Popen(
+        [
+            chromium_executable,
+            f"--remote-debugging-port={debug_port}",
+            "--remote-debugging-address=127.0.0.1",
+            f"--user-data-dir={user_data_dir}",
+            "--new-window",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            chapter_url,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    try:
+        websocket_url = wait_for_debugger_target(
+            debug_port,
+            browser_process,
+            timeout=BROWSER_STARTUP_TIMEOUT,
+            target_url=chapter_url,
+        )
+        with ChromeDevToolsClient(websocket_url, timeout=DEFAULT_TIMEOUT) as client:
+            client.call("Page.enable")
+            client.call("Runtime.enable")
+            client.call("Page.bringToFront")
+
+            deadline = time.monotonic() + BROWSER_RENDER_TIMEOUT
+            while time.monotonic() < deadline:
+                rendered_sources = client.evaluate(RENDERED_IMAGE_QUERY)
+                if isinstance(rendered_sources, list) and rendered_sources:
+                    images = normalize_image_sources(rendered_sources, chapter_url)
+                    if images:
+                        return images
+
+                client.evaluate("window.scrollTo(0, document.body.scrollHeight); true")
+                time.sleep(BROWSER_POLL_INTERVAL)
+    finally:
+        close_browser_process(browser_process)
+        cleanup_browser_profile(user_data_dir)
+
+    raise RuntimeError("Chromium rendered the page but no chapter images were exposed in the DOM.")
+
+
+def resolve_chapter_images(
+    chapter_html: str,
+    chapter_url: str,
+    browser_image_fetcher: BrowserImageFetcher | None = fetch_chapter_images_with_browser,
+) -> list[str]:
+    image_urls = parse_chapter_images(chapter_html, chapter_url)
+    if image_urls:
+        return image_urls
+
+    browser_error: RuntimeError | None = None
+    if browser_image_fetcher is not None:
+        try:
+            browser_image_urls = browser_image_fetcher(chapter_url)
+        except RuntimeError as exc:
+            browser_error = exc
+        else:
+            if browser_image_urls:
+                return normalize_image_sources(browser_image_urls, chapter_url)
+
+    if not has_reader_markup(chapter_html):
+        detail = f" Browser fallback failed: {browser_error}" if browser_error else ""
+        raise RuntimeError(
+            "The fetched HTML does not contain manga reader markup. "
+            "The site may be loading the chapter client-side or serving "
+            f"different content to automated requests for {chapter_url}.{detail}"
+        )
+
+    detail = f" Browser fallback failed: {browser_error}" if browser_error else ""
+    raise RuntimeError(f"No images were found in {chapter_url}.{detail}")
 
 
 def first_non_empty(*values: str | None) -> str | None:
@@ -241,13 +709,16 @@ def download_chapter_to_pdf(
     chapter: Chapter,
     series_title: str,
     output_dir: Path,
+    browser_image_fetcher: BrowserImageFetcher | None = fetch_chapter_images_with_browser,
 ) -> Path:
     print(f"\nDownloading {chapter.display_name} ...")
     chapter_html = fetch_html(session, chapter.url)
     ensure_not_under_construction(chapter_html)
-    image_urls = parse_chapter_images(chapter_html, chapter.url)
-    if not image_urls:
-        raise RuntimeError(f"No images were found in {chapter.url}.")
+    image_urls = resolve_chapter_images(
+        chapter_html,
+        chapter.url,
+        browser_image_fetcher=browser_image_fetcher,
+    )
 
     chapter_folder = output_dir / slugify(series_title)
     chapter_folder.mkdir(parents=True, exist_ok=True)
@@ -372,12 +843,29 @@ def main() -> int:
         default="downloads",
         help="Output directory for generated PDFs (default: downloads)",
     )
+    parser.add_argument(
+        "--no-browser-fallback",
+        action="store_true",
+        help="Disable the Chromium fallback for chapters that hide images from direct requests.",
+    )
+    parser.add_argument(
+        "--browser-cookies",
+        choices=("auto", "brave", "chrome", "chromium", "firefox", "none"),
+        default="auto",
+        help=(
+            "Load mangaread cookies from a local browser profile before fetching chapters "
+            "(default: auto)."
+        ),
+    )
     args = parser.parse_args()
 
     try:
         input_url = prompt_for_url(args.url)
         series_url = normalize_series_url(input_url)
         session = build_session()
+        cookie_source = load_browser_cookies_into_session(session, args.browser_cookies)
+        if cookie_source:
+            print(f"Loaded browser cookies from: {cookie_source}")
 
         print(f"Fetching series page: {series_url}")
         series_html = fetch_html(session, series_url)
@@ -391,7 +879,24 @@ def main() -> int:
         output_dir = Path(args.output).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        download_selected_chapters(session, selected_chapters, series_title, output_dir)
+        browser_image_fetcher = None if args.no_browser_fallback else fetch_chapter_images_with_browser
+
+        def chapter_downloader(active_session, chapter, active_series_title, active_output_dir):
+            return download_chapter_to_pdf(
+                active_session,
+                chapter,
+                active_series_title,
+                active_output_dir,
+                browser_image_fetcher=browser_image_fetcher,
+            )
+
+        download_selected_chapters(
+            session,
+            selected_chapters,
+            series_title,
+            output_dir,
+            chapter_downloader=chapter_downloader,
+        )
 
         print("\nDone.")
         return 0

@@ -63,6 +63,7 @@ Valid selections:
 
 - `all` to download every chapter
 - `12` to download a single chapter
+- `120-160` to download a continuous chapter range
 - `1,2,5` to download multiple chapters
 
 ## Cooldown and Retry Behavior

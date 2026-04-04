@@ -3,7 +3,7 @@
 Developer: Gerald-H
 GitHub: https://github.com/Gerald-Ha
 Project: MangaSnatcher
-Version: 2.0
+Version: 3.0
 """
 
 from __future__ import annotations
@@ -41,7 +41,9 @@ ERROR_RETRY_DELAY = 60
 BROWSER_STARTUP_TIMEOUT = 10
 BROWSER_RENDER_TIMEOUT = 20
 BROWSER_POLL_INTERVAL = 0.5
-CHAPTER_URL_RE = re.compile(r"/chapter-(\d+)/?$", re.IGNORECASE)
+CHAPTER_URL_RE = re.compile(r"/chapter-(\d+)(?:[._-]\d+)?/?$", re.IGNORECASE)
+CHAPTER_TITLE_RE = re.compile(r"\bchapter\s+(\d+)(?:[._-]\d+)?\b", re.IGNORECASE)
+IMAGE_EXTENSION_FALLBACKS = (".jpg", ".jpeg", ".png", ".webp")
 CHROMIUM_CANDIDATES = (
     "brave-browser",
     "brave",
@@ -165,13 +167,25 @@ def parse_chapters(html: str, base_url: str) -> list[Chapter]:
             continue
         seen.add(chapter_url)
         title = " ".join(anchor.get_text(" ", strip=True).split())
-        match = CHAPTER_URL_RE.search(urlparse(chapter_url).path)
-        number = int(match.group(1)) if match else None
+        number = extract_chapter_number(chapter_url, title)
         chapters.append(Chapter(title=title or chapter_url, url=chapter_url, number=number))
 
     if chapters and all(chapter.number is not None for chapter in chapters):
         chapters.sort(key=lambda chapter: chapter.number or 0)
     return chapters
+
+
+def extract_chapter_number(chapter_url: str, title: str) -> int | None:
+    path = urlparse(chapter_url).path
+    match = CHAPTER_URL_RE.search(path)
+    if match:
+        return int(match.group(1))
+
+    title_match = CHAPTER_TITLE_RE.search(title)
+    if title_match:
+        return int(title_match.group(1))
+
+    return None
 
 
 def parse_chapter_images(html: str, chapter_url: str) -> list[str]:
@@ -670,6 +684,7 @@ def choose_chapters(chapters: list[Chapter]) -> list[Chapter]:
         "\nWhich chapters should be downloaded?\n"
         "- 'all' for all chapters\n"
         "- a chapter number, e.g. '12'\n"
+        "- a chapter range, e.g. '120-160'\n"
         "- multiple numbers, e.g. '1,2,5'\n"
         "Selection: "
     )
@@ -681,7 +696,7 @@ def choose_chapters(chapters: list[Chapter]) -> list[Chapter]:
     selected = [chapter for chapter in chapters if chapter.number in requested_numbers]
     if not selected:
         raise ValueError("No matching chapter was found for the selected input.")
-    return selected
+    return sort_selected_chapters(selected)
 
 
 def parse_requested_numbers(choice: str) -> set[int]:
@@ -696,12 +711,67 @@ def parse_requested_numbers(choice: str) -> set[int]:
         if token.isdigit():
             numbers.add(int(token))
             continue
+        if "-" in token:
+            start_text, end_text = token.split("-", 1)
+            start_text = start_text.strip()
+            end_text = end_text.strip()
+            if start_text.isdigit() and end_text.isdigit():
+                start_number = int(start_text)
+                end_number = int(end_text)
+                lower, upper = sorted((start_number, end_number))
+                numbers.update(range(lower, upper + 1))
+                continue
         raise ValueError(
-            "Invalid selection. Use 'all', one number, or multiple comma-separated numbers."
+            "Invalid selection. Use 'all', one number, a range like '120-160', "
+            "or multiple comma-separated numbers."
         )
     if not numbers:
         raise ValueError("No valid chapter number was found.")
     return numbers
+
+
+def sort_selected_chapters(chapters: list[Chapter]) -> list[Chapter]:
+    return sorted(
+        chapters,
+        key=lambda chapter: (
+            chapter.number is None,
+            -(chapter.number if chapter.number is not None else -1),
+            chapter.title.lower(),
+            chapter.url,
+        ),
+    )
+
+
+def build_image_url_candidates(image_url: str) -> list[str]:
+    parsed = urlparse(image_url)
+    path = parsed.path
+    lower_path = path.lower()
+    for extension in IMAGE_EXTENSION_FALLBACKS:
+        if lower_path.endswith(extension):
+            base_path = path[: -len(extension)]
+            file_name = Path(base_path).name
+            parent_path = str(Path(base_path).parent)
+            candidates = [image_url]
+
+            def add_candidate(candidate_path: str) -> None:
+                candidate_url = parsed._replace(path=candidate_path).geturl()
+                if candidate_url not in candidates:
+                    candidates.append(candidate_url)
+
+            for candidate_extension in IMAGE_EXTENSION_FALLBACKS:
+                add_candidate(f"{base_path}{candidate_extension}")
+
+            if file_name.isdigit() and len(file_name) >= 2:
+                repaired_base_path = (
+                    f"{parent_path}/{file_name}0"
+                    if parent_path not in {"", ".", "/"}
+                    else f"/{file_name}0"
+                )
+                for candidate_extension in IMAGE_EXTENSION_FALLBACKS:
+                    add_candidate(f"{repaired_base_path}{candidate_extension}")
+
+            return candidates
+    return [image_url]
 
 
 def download_chapter_to_pdf(
@@ -780,17 +850,37 @@ def download_selected_chapters(
 def download_image(
     session: requests.Session, image_url: str, destination: Path, referer: str
 ) -> None:
-    response = session.get(
-        image_url,
-        timeout=DEFAULT_TIMEOUT,
-        headers={"Referer": referer},
-        stream=True,
-    )
-    response.raise_for_status()
-    with destination.open("wb") as file_handle:
-        for chunk in response.iter_content(chunk_size=1024 * 64):
-            if chunk:
-                file_handle.write(chunk)
+    last_error: requests.RequestException | None = None
+    image_url_candidates = build_image_url_candidates(image_url)
+
+    for index, candidate_url in enumerate(image_url_candidates):
+        response = session.get(
+            candidate_url,
+            timeout=DEFAULT_TIMEOUT,
+            headers={"Referer": referer},
+            stream=True,
+        )
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            last_error = exc
+            status_code = response.status_code
+            if status_code == 404 and index < len(image_url_candidates) - 1:
+                response.close()
+                continue
+            response.close()
+            raise
+
+        with destination.open("wb") as file_handle:
+            for chunk in response.iter_content(chunk_size=1024 * 64):
+                if chunk:
+                    file_handle.write(chunk)
+        response.close()
+        return
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Image download failed for {image_url}.")
 
 
 def export_images_to_pdf(image_paths: list[Path], pdf_path: Path) -> None:

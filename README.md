@@ -1,4 +1,5 @@
 # MangaSnatcher
+<img src="https://github.com/user-attachments/assets/088e07b2-6bb0-4466-9590-5c781d983c3f" width="300" height="auto">
 
 MangaSnatcher is a small Python command-line tool that downloads manga chapters from supported manga/manhua websites and saves them as PDF files.
 

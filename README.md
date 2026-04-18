@@ -1,6 +1,6 @@
 # MangaSnatcher
 
-MangaSnatcher is a small Python command-line tool that downloads manga chapters from `https://www.mangaread.org/` style pages and saves them as PDF files.
+MangaSnatcher is a small Python command-line tool that downloads manga chapters from supported manga/manhua websites and saves them as PDF files.
 
 It can:
 
@@ -12,6 +12,12 @@ It can:
 - Apply a built-in cooldown between chapter downloads
 - Retry failed chapter downloads automatically
 - Fall back to Chromium for chapters that hide reader images from direct requests
+- Use source adapters so new websites can be added without changing the downloader core
+
+Supported sources:
+
+- `mangaread.org`
+- `manhuaus.org`
 
 ## Credits
 
@@ -24,7 +30,7 @@ It can:
 - Python 3.10 or newer
 - Internet connection
 - `chromium-browser`, `chromium`, or `google-chrome` if a site only exposes chapter images after real browser rendering
-- `browser-cookie3` support is included via `requirements.txt` so MangaSnatcher can reuse login cookies from Brave/Chrome/Chromium/Firefox
+- `browser-cookie3` support is included via `requirements.txt` so MangaSnatcher can reuse login cookies from common local browser profiles
 
 Python dependencies:
 
@@ -49,6 +55,12 @@ Run the downloader with a manga series URL or a chapter URL:
 
 ```bash
 python MangaSnatcher.py "https://www.mangaread.org/manga/example-series/"
+```
+
+For ManhuaUS:
+
+```bash
+python MangaSnatcher.py "https://manhuaus.org/manga/the-reincarnated-assassin-is-a-genius-swordsman/"
 ```
 
 You can also run it without an argument and paste the URL interactively:
@@ -81,9 +93,13 @@ Example output structure:
 
 ```text
 downloads/
-  example-series/
-    example-series-chapter-1.pdf
-    example-series-chapter-2.pdf
+  mangaread.org/
+    example-series/
+      example-series-chapter-1.pdf
+      example-series-chapter-2.pdf
+  manhuaus.org/
+    the-reincarnated-assassin-is-a-genius-swordsman/
+      the-reincarnated-assassin-is-a-genius-swordsman-chapter-1.pdf
 ```
 
 You can set a custom output folder with:
@@ -98,13 +114,19 @@ If a chapter page hides its reader images from normal HTTP requests, MangaSnatch
 python MangaSnatcher.py "https://www.mangaread.org/manga/example-series/" --no-browser-fallback
 ```
 
-If the site only serves chapter images to your logged-in browser session, MangaSnatcher can also import cookies from your local browser profile:
+If the site only serves pages or chapter images to your logged-in browser session, MangaSnatcher can also import cookies from your local browser profile:
 
 ```bash
 python MangaSnatcher.py "https://www.mangaread.org/manga/example-series/" --browser-cookies brave
 ```
 
-Supported values are `auto`, `brave`, `chrome`, `chromium`, `firefox`, and `none`.
+Supported values are `auto`, `brave`, `chrome`, `chromium`, `edge`, `firefox`, `opera`, `vivaldi`, and `none`.
+
+Some sources, including `manhuaus.org`, may show a Cloudflare or anti-bot challenge to direct HTTP requests. When MangaSnatcher detects this while loading the series page, the recommended fallback is a temporary private Chromium window controlled by MangaSnatcher. Complete the challenge in that window and press Enter in the terminal. MangaSnatcher then reads the rendered page HTML and imports cookies from that same Chromium session. The temporary Chromium window stays available during the run, so protected chapter pages can be loaded through the same browser context.
+
+If temporary Chromium is unavailable or declined, MangaSnatcher can still offer the older system-default-browser cookie retry.
+
+This does not bypass Cloudflare automatically. It only gives you a manual browser step and a cleaner explanation instead of a raw `403 Forbidden` error.
 
 ## Startup Update Check
 
@@ -124,7 +146,7 @@ Optional environment variables:
 - `UPDATE_SERVER_URL` defaults to `https://update.gerald-hasani.com`
 - `UPDATE_PROJECT_ID` defaults to `mangasnatcher`
 - `UPDATE_CHANNEL` defaults to `stable`
-- `APP_VERSION` defaults to `3.0.5`
+- `APP_VERSION` defaults to `4.0.0`
 - `BUILD_NUMBER`, `GIT_COMMIT`, and `DOCKER_IMAGE_DIGEST` are sent when present
 
 If the update server is unreachable, MangaSnatcher prints a short notice and
@@ -133,10 +155,11 @@ continues normally.
 ## How It Works
 
 1. MangaSnatcher loads the provided series or chapter URL.
-2. It normalizes the URL to the series page.
-3. It scans the page for chapter links.
-4. It loads the selected chapters and collects the page images.
-5. It converts the images into PDF files.
+2. It selects the matching source adapter for the website.
+3. It normalizes the URL to the series page.
+4. It scans the page for chapter links using the source adapter.
+5. It loads the selected chapters and collects the page images.
+6. It converts the images into PDF files.
 
 
 ## Disclaimer

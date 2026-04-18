@@ -22,20 +22,22 @@ import sys
 import tempfile
 import time
 import uuid
+import webbrowser
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import Callable, Iterable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 from urllib.request import urlopen
 
 import requests
-from bs4 import BeautifulSoup
 from PIL import Image, ImageFile
+
+from sources import Chapter, MangaReadSource, SourceAdapter, get_source_adapter, normalize_image_sources
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-APP_VERSION = os.environ.get("APP_VERSION", "3.0.5")
+APP_VERSION = os.environ.get("APP_VERSION", "4.0.0")
 UPDATE_SERVER_URL = os.environ.get(
     "UPDATE_SERVER_URL",
     "https://update.gerald-hasani.com",
@@ -52,8 +54,18 @@ ERROR_RETRY_DELAY = 60
 BROWSER_STARTUP_TIMEOUT = 10
 BROWSER_RENDER_TIMEOUT = 20
 BROWSER_POLL_INTERVAL = 0.5
-CHAPTER_URL_RE = re.compile(r"/chapter-(\d+)(?:[._-]\d+)?/?$", re.IGNORECASE)
-CHAPTER_TITLE_RE = re.compile(r"\bchapter\s+(\d+)(?:[._-]\d+)?\b", re.IGNORECASE)
+CLOUDFLARE_STATUS_CODES = {403, 429, 503}
+CLOUDFLARE_MARKERS = (
+    "just a moment",
+    "checking your browser",
+    "enable javascript and cookies",
+    "attention required",
+    "cf-browser-verification",
+    "__cf_chl",
+    "cf_chl",
+    "challenge-platform",
+    "cloudflare",
+)
 IMAGE_EXTENSION_FALLBACKS = (".jpg", ".jpeg", ".png", ".webp")
 CHROMIUM_CANDIDATES = (
     "brave-browser",
@@ -62,8 +74,16 @@ CHROMIUM_CANDIDATES = (
     "chromium",
     "google-chrome",
 )
-BROWSER_COOKIE_DOMAIN = "www.mangaread.org"
-BROWSER_COOKIE_CANDIDATES = ("brave", "chrome", "chromium", "firefox")
+BROWSER_COOKIE_CANDIDATES = (
+    "brave",
+    "chrome",
+    "chromium",
+    "edge",
+    "firefox",
+    "opera",
+    "vivaldi",
+)
+DEFAULT_SOURCE_ADAPTER = MangaReadSource()
 RENDERED_IMAGE_QUERY = """
 (() => Array.from(
     document.querySelectorAll('.reading-content img.wp-manga-chapter-img, .reading-content img')
@@ -72,19 +92,7 @@ RENDERED_IMAGE_QUERY = """
 """.strip()
 
 BrowserImageFetcher = Callable[[str], list[str]]
-
-
-@dataclass(frozen=True)
-class Chapter:
-    title: str
-    url: str
-    number: int | None
-
-    @property
-    def display_name(self) -> str:
-        if self.number is not None:
-            return f"Chapter {self.number}"
-        return self.title
+HtmlFetcher = Callable[[requests.Session, str], str]
 
 
 @dataclass
@@ -104,6 +112,17 @@ class UpdateCheckResult:
     update_link: str | None = None
     notes_url: str | None = None
     message: str | None = None
+
+
+class CloudflareProtectionError(RuntimeError):
+    def __init__(self, url: str, status_code: int | None = None) -> None:
+        self.url = url
+        self.status_code = status_code
+        status_detail = f" (HTTP {status_code})" if status_code else ""
+        super().__init__(
+            "Cloudflare or anti-bot protection blocked the request"
+            f"{status_detail}: {url}"
+        )
 
 
 def build_session() -> requests.Session:
@@ -310,17 +329,7 @@ def normalize_url(url: str) -> str:
 
 
 def normalize_series_url(url: str) -> str:
-    parsed = urlparse(normalize_url(url))
-    parts = [part for part in parsed.path.split("/") if part]
-    if "chapter" in parts:
-        chapter_index = parts.index("chapter")
-        parts = parts[:chapter_index]
-    elif parts and parts[-1].startswith("chapter-"):
-        parts = parts[:-1]
-    if len(parts) < 2:
-        raise ValueError("The URL does not look like a valid series or chapter URL.")
-    normalized_path = "/" + "/".join(parts) + "/"
-    return f"{parsed.scheme or 'https'}://{parsed.netloc}{normalized_path}"
+    return DEFAULT_SOURCE_ADAPTER.normalize_series_url(url)
 
 
 def slugify(text: str) -> str:
@@ -329,18 +338,7 @@ def slugify(text: str) -> str:
 
 
 def extract_title(html: str, fallback_url: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    meta_title = soup.find("meta", property="og:title")
-    if meta_title and meta_title.get("content"):
-        return meta_title["content"].strip()
-    if soup.title and soup.title.string:
-        title = soup.title.string.strip()
-        if title:
-            return re.sub(r"\s*[-|].*$", "", title).strip() or title
-    slug = [part for part in urlparse(fallback_url).path.split("/") if part]
-    if len(slug) >= 2:
-        return slug[-1].replace("-", " ").strip()
-    return "manga-download"
+    return DEFAULT_SOURCE_ADAPTER.extract_title(html, fallback_url)
 
 
 def ensure_not_under_construction(html: str) -> None:
@@ -353,92 +351,48 @@ def ensure_not_under_construction(html: str) -> None:
         )
 
 
+def is_cloudflare_challenge_html(html: str) -> bool:
+    lowered = html.lower()
+    return any(marker in lowered for marker in CLOUDFLARE_MARKERS)
+
+
+def response_has_cloudflare_headers(response: requests.Response) -> bool:
+    server = response.headers.get("server", "").lower()
+    if "cloudflare" in server:
+        return True
+    return any(header_name.lower().startswith("cf-") for header_name in response.headers)
+
+
+def is_cloudflare_response(response: requests.Response) -> bool:
+    if is_cloudflare_challenge_html(response.text):
+        return True
+    if response.status_code not in CLOUDFLARE_STATUS_CODES:
+        return False
+    return response.status_code == 403 or response_has_cloudflare_headers(response)
+
+
 def fetch_html(session: requests.Session, url: str) -> str:
     response = session.get(url, timeout=DEFAULT_TIMEOUT)
+    if is_cloudflare_response(response):
+        raise CloudflareProtectionError(url, response.status_code)
     response.raise_for_status()
     return response.text
 
 
 def parse_chapters(html: str, base_url: str) -> list[Chapter]:
-    soup = BeautifulSoup(html, "html.parser")
-    anchors = soup.select(".listing-chapters_wrap li.wp-manga-chapter a")
-    if not anchors:
-        anchors = soup.select("a[href*='/chapter-']")
-
-    chapters: list[Chapter] = []
-    seen: set[str] = set()
-    for anchor in anchors:
-        href = anchor.get("href")
-        if not href:
-            continue
-        chapter_url = urljoin(base_url, href.strip())
-        if chapter_url in seen:
-            continue
-        seen.add(chapter_url)
-        title = " ".join(anchor.get_text(" ", strip=True).split())
-        number = extract_chapter_number(chapter_url, title)
-        chapters.append(Chapter(title=title or chapter_url, url=chapter_url, number=number))
-
-    if chapters and all(chapter.number is not None for chapter in chapters):
-        chapters.sort(key=lambda chapter: chapter.number or 0)
-    return chapters
+    return DEFAULT_SOURCE_ADAPTER.parse_chapters(html, base_url)
 
 
 def extract_chapter_number(chapter_url: str, title: str) -> int | None:
-    path = urlparse(chapter_url).path
-    match = CHAPTER_URL_RE.search(path)
-    if match:
-        return int(match.group(1))
-
-    title_match = CHAPTER_TITLE_RE.search(title)
-    if title_match:
-        return int(title_match.group(1))
-
-    return None
+    return DEFAULT_SOURCE_ADAPTER.extract_chapter_number(chapter_url, title)
 
 
 def parse_chapter_images(html: str, chapter_url: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    selectors = (
-        ".reading-content img.wp-manga-chapter-img, "
-        ".reading-content img, "
-        "img.wp-manga-chapter-img"
-    )
-
-    return normalize_image_sources(
-        (
-            first_non_empty(
-                image.get("data-src"),
-                image.get("data-lazy-src"),
-                image.get("src"),
-            )
-            for image in soup.select(selectors)
-        ),
-        chapter_url,
-    )
+    return DEFAULT_SOURCE_ADAPTER.parse_chapter_images(html, chapter_url)
 
 
 def has_reader_markup(html: str) -> bool:
-    lowered = html.lower()
-    return any(
-        marker in lowered
-        for marker in ("wp-manga-current-chap", "wp-manga-chapter-img", "page-break")
-    )
-
-
-def normalize_image_sources(sources: Iterable[str | None], chapter_url: str) -> list[str]:
-    images: list[str] = []
-    seen: set[str] = set()
-    for source in sources:
-        if not source:
-            continue
-        cleaned_source = re.sub(r"\s+", "", source)
-        absolute_source = urljoin(chapter_url, cleaned_source)
-        if absolute_source in seen:
-            continue
-        seen.add(absolute_source)
-        images.append(absolute_source)
-    return images
+    return DEFAULT_SOURCE_ADAPTER.has_reader_markup(html)
 
 
 def find_chromium_executable() -> str | None:
@@ -470,6 +424,16 @@ def session_has_domain_cookie(session: requests.Session, domain: str) -> bool:
     return False
 
 
+def cookie_domain_matches(cookie_domain: str, domain: str) -> bool:
+    normalized_cookie_domain = cookie_domain.lstrip(".")
+    normalized_domain = domain.lstrip(".")
+    return (
+        normalized_cookie_domain == normalized_domain
+        or normalized_cookie_domain.endswith(f".{normalized_domain}")
+        or normalized_domain.endswith(f".{normalized_cookie_domain}")
+    )
+
+
 def add_cookiejar_to_session(session: requests.Session, cookiejar) -> int:
     added = 0
     for cookie in cookiejar:
@@ -478,10 +442,36 @@ def add_cookiejar_to_session(session: requests.Session, cookiejar) -> int:
     return added
 
 
+def add_browser_cookies_to_session(
+    session: requests.Session,
+    cookies: Iterable[dict],
+    domain_name: str,
+) -> int:
+    added = 0
+    for cookie in cookies:
+        name = cookie.get("name")
+        value = cookie.get("value")
+        cookie_domain = cookie.get("domain") or domain_name
+        if not name or value is None:
+            continue
+        if not cookie_domain_matches(str(cookie_domain), domain_name):
+            continue
+
+        session.cookies.set(
+            str(name),
+            str(value),
+            domain=str(cookie_domain),
+            path=str(cookie.get("path") or "/"),
+            secure=bool(cookie.get("secure")),
+        )
+        added += 1
+    return added
+
+
 def load_browser_cookies_into_session(
     session: requests.Session,
     browser_name: str = "auto",
-    domain_name: str = BROWSER_COOKIE_DOMAIN,
+    domain_name: str = DEFAULT_SOURCE_ADAPTER.cookie_domain or DEFAULT_SOURCE_ADAPTER.download_folder,
 ) -> str | None:
     browser_cookie3 = import_browser_cookie_module()
     if browser_cookie3 is None:
@@ -509,6 +499,141 @@ def load_browser_cookies_into_session(
             return candidate_name
 
     return None
+
+
+def prompt_for_cloudflare_browser_retry(
+    url: str,
+    input_func: Callable[[str], str] = input,
+    browser_opener: Callable[..., bool] = webbrowser.open,
+) -> bool:
+    print()
+    print("Cloudflare or anti-bot protection appears to be blocking this request.")
+    print(
+        "MangaSnatcher cannot solve that challenge automatically, but it can "
+        "retry after you open the page in your normal browser."
+    )
+    print(
+        "Your system default browser will be used. After the page loads, "
+        "MangaSnatcher will try to reuse browser cookies when possible."
+    )
+
+    try:
+        answer = input_func("Open the page in your default browser now? [y/N]: ").strip().lower()
+    except EOFError:
+        return False
+
+    if answer not in {"y", "yes", "j", "ja"}:
+        return False
+
+    try:
+        opened = browser_opener(url, new=2)
+    except Exception as exc:
+        opened = False
+        print(f"Could not open the browser automatically: {exc}")
+
+    if opened:
+        print("Browser opened. Complete the challenge or make sure the page loads normally.")
+    else:
+        print(f"Please open this URL manually in your browser: {url}")
+
+    try:
+        input_func("Press Enter here after the page has loaded successfully, then I will retry.")
+    except EOFError:
+        return False
+    return True
+
+
+def fetch_series_html_with_cloudflare_retry(
+    session: requests.Session,
+    series_url: str,
+    source_adapter: SourceAdapter,
+    browser_name: str = "auto",
+    input_func: Callable[[str], str] = input,
+    browser_opener: Callable[..., bool] = webbrowser.open,
+    interactive_browser_fetcher: Callable[
+        [requests.Session, str, SourceAdapter, Callable[[str], str]],
+        str,
+    ] | None = None,
+) -> str:
+    try:
+        return fetch_html(session, series_url)
+    except CloudflareProtectionError as original_error:
+        print()
+        print("Cloudflare or anti-bot protection appears to be blocking this request.")
+        print(
+            "The recommended path is a temporary private Chromium window controlled "
+            "by MangaSnatcher."
+        )
+        print(
+            "Complete the check there, then MangaSnatcher can read the page from "
+            "that same browser context."
+        )
+
+        active_browser_fetcher = interactive_browser_fetcher or fetch_html_with_interactive_browser
+        try:
+            answer = input_func(
+                "Open the temporary private Chromium window now? [Y/n]: "
+            ).strip().lower()
+        except EOFError:
+            answer = "n"
+
+        if answer in {"", "y", "yes", "j", "ja"}:
+            try:
+                return active_browser_fetcher(
+                    session,
+                    series_url,
+                    source_adapter,
+                    input_func,
+                )
+            except RuntimeError as exc:
+                print(f"Temporary private Chromium fallback unavailable: {exc}")
+            except CloudflareProtectionError as exc:
+                print(f"Temporary private Chromium is still blocked: {exc}")
+
+        if not prompt_for_cloudflare_browser_retry(
+            series_url,
+            input_func=input_func,
+            browser_opener=browser_opener,
+        ):
+            raise original_error
+
+        cookie_source = load_browser_cookies_into_session(
+            session,
+            browser_name,
+            domain_name=source_adapter.cookie_domain or source_adapter.download_folder,
+        )
+        if cookie_source:
+            print(f"Reloaded browser cookies from: {cookie_source}")
+        elif browser_name == "none":
+            print("Browser cookie loading is disabled; retrying without new cookies.")
+        else:
+            print("No matching browser cookies could be loaded automatically; retrying anyway.")
+
+        print("Retrying series page after browser check...")
+        try:
+            return fetch_html(session, series_url)
+        except CloudflareProtectionError:
+            print()
+            print(
+                "The request is still blocked after reloading browser cookies. "
+                "This usually means the cookies could not be copied from the browser profile."
+            )
+            try:
+                answer = input_func(
+                    "Open the temporary private Chromium window controlled by MangaSnatcher and retry from there? [y/N]: "
+                ).strip().lower()
+            except EOFError:
+                raise
+
+            if answer not in {"y", "yes", "j", "ja"}:
+                raise
+
+            return active_browser_fetcher(
+                session,
+                series_url,
+                source_adapter,
+                input_func,
+            )
 
 
 def reserve_local_port() -> int:
@@ -769,18 +894,185 @@ def cleanup_browser_profile(user_data_dir: str) -> None:
             time.sleep(0.5)
 
 
+def ensure_graphical_browser_available() -> None:
+    if sys.platform.startswith("linux") and not (
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    ):
+        raise RuntimeError(
+            "A graphical browser session is required on Linux "
+            "(missing DISPLAY or WAYLAND_DISPLAY)."
+        )
+
+
+class ControlledBrowserHtmlFetcher:
+    def __init__(self) -> None:
+        self.browser_process: subprocess.Popen[str] | None = None
+        self.client: ChromeDevToolsClient | None = None
+        self.user_data_dir: str | None = None
+
+    @property
+    def is_running(self) -> bool:
+        return self.client is not None and self.browser_process is not None
+
+    def __call__(
+        self,
+        session: requests.Session,
+        url: str,
+        source_adapter: SourceAdapter,
+        input_func: Callable[[str], str] = input,
+    ) -> str:
+        first_open = not self.is_running
+        if first_open:
+            self._start(url)
+            print()
+            print("A temporary private Chromium window has been opened for this protected page.")
+            print(
+                "Complete the Cloudflare check there and make sure the manga page "
+                "is visible before continuing."
+            )
+            input_func("Press Enter here after the page has loaded successfully.")
+        else:
+            print(f"Loading protected page through the temporary private Chromium window: {url}")
+            self._navigate(url)
+
+        html = self._read_ready_html(url)
+        if is_cloudflare_challenge_html(html):
+            print()
+            print("The temporary Chromium window is still showing a protection page.")
+            print("Complete the check there and make sure the requested page is visible.")
+            input_func("Press Enter here after the page has loaded successfully.")
+            html = self._read_ready_html(url)
+
+        cookie_count = self._import_cookies(session, source_adapter)
+        if cookie_count:
+            print(f"Imported {cookie_count} cookies from the temporary Chromium session.")
+
+        if not html or is_cloudflare_challenge_html(html):
+            raise CloudflareProtectionError(url)
+
+        return html
+
+    def close(self) -> None:
+        if self.client is not None:
+            self.client.__exit__(None, None, None)
+            self.client = None
+        if self.browser_process is not None:
+            close_browser_process(self.browser_process)
+            self.browser_process = None
+        if self.user_data_dir is not None:
+            cleanup_browser_profile(self.user_data_dir)
+            self.user_data_dir = None
+
+    def _start(self, url: str) -> None:
+        chromium_executable = find_chromium_executable()
+        if not chromium_executable:
+            raise RuntimeError(
+                "Chromium is not installed, so the interactive Cloudflare fallback is unavailable."
+            )
+
+        ensure_graphical_browser_available()
+
+        debug_port = reserve_local_port()
+        self.user_data_dir = tempfile.mkdtemp(prefix="manga_snatcher_cloudflare_")
+
+        self.browser_process = subprocess.Popen(
+            [
+                chromium_executable,
+                f"--remote-debugging-port={debug_port}",
+                "--remote-debugging-address=127.0.0.1",
+                f"--user-data-dir={self.user_data_dir}",
+                "--incognito",
+                "--new-window",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-background-networking",
+                url,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        websocket_url = wait_for_debugger_target(
+            debug_port,
+            self.browser_process,
+            timeout=BROWSER_STARTUP_TIMEOUT,
+            target_url=url,
+        )
+        self.client = ChromeDevToolsClient(websocket_url, timeout=DEFAULT_TIMEOUT)
+        self.client.__enter__()
+        self.client.call("Page.enable")
+        self.client.call("Runtime.enable")
+        self.client.call("Network.enable")
+        self.client.call("Page.bringToFront")
+
+    def _navigate(self, url: str) -> None:
+        if self.client is None:
+            raise RuntimeError("Controlled Chromium is not running.")
+        self.client.call("Page.navigate", {"url": url})
+
+    def _read_ready_html(self, expected_url: str) -> str:
+        if self.client is None:
+            raise RuntimeError("Controlled Chromium is not running.")
+
+        html = ""
+        deadline = time.monotonic() + BROWSER_RENDER_TIMEOUT
+        normalized_expected_url = expected_url.rstrip("/")
+        while time.monotonic() < deadline:
+            current_url = str(self.client.evaluate("window.location.href") or "")
+            ready_state = self.client.evaluate("document.readyState")
+            html_result = self.client.evaluate(
+                "document.documentElement ? document.documentElement.outerHTML : ''"
+            )
+            if html_result:
+                html = str(html_result)
+                normalized_current_url = current_url.rstrip("/")
+                url_matches = (
+                    normalized_current_url == normalized_expected_url
+                    or normalized_current_url.startswith(f"{normalized_expected_url}?")
+                    or is_cloudflare_challenge_html(html)
+                )
+                if ready_state in {"interactive", "complete"} and url_matches:
+                    return html
+            time.sleep(BROWSER_POLL_INTERVAL)
+        return html
+
+    def _import_cookies(
+        self,
+        session: requests.Session,
+        source_adapter: SourceAdapter,
+    ) -> int:
+        if self.client is None:
+            raise RuntimeError("Controlled Chromium is not running.")
+
+        cookie_result = self.client.call("Network.getAllCookies")
+        cookies = cookie_result.get("cookies", [])
+        return add_browser_cookies_to_session(
+            session,
+            cookies if isinstance(cookies, list) else [],
+            domain_name=source_adapter.cookie_domain or source_adapter.download_folder,
+        )
+
+
+def fetch_html_with_interactive_browser(
+    session: requests.Session,
+    url: str,
+    source_adapter: SourceAdapter,
+    input_func: Callable[[str], str] = input,
+) -> str:
+    browser_fetcher = ControlledBrowserHtmlFetcher()
+    try:
+        return browser_fetcher(session, url, source_adapter, input_func)
+    finally:
+        browser_fetcher.close()
+
+
 def fetch_chapter_images_with_browser(chapter_url: str) -> list[str]:
     chromium_executable = find_chromium_executable()
     if not chromium_executable:
         raise RuntimeError("Chromium is not installed, so browser fallback is unavailable.")
 
-    if sys.platform.startswith("linux") and not (
-        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
-    ):
-        raise RuntimeError(
-            "Browser fallback requires a graphical session on Linux "
-            "(missing DISPLAY or WAYLAND_DISPLAY)."
-        )
+    ensure_graphical_browser_available()
 
     debug_port = reserve_local_port()
     user_data_dir = tempfile.mkdtemp(prefix="manga_snatcher_chromium_")
@@ -791,6 +1083,7 @@ def fetch_chapter_images_with_browser(chapter_url: str) -> list[str]:
             f"--remote-debugging-port={debug_port}",
             "--remote-debugging-address=127.0.0.1",
             f"--user-data-dir={user_data_dir}",
+            "--incognito",
             "--new-window",
             "--no-first-run",
             "--no-default-browser-check",
@@ -835,8 +1128,9 @@ def resolve_chapter_images(
     chapter_html: str,
     chapter_url: str,
     browser_image_fetcher: BrowserImageFetcher | None = fetch_chapter_images_with_browser,
+    source_adapter: SourceAdapter = DEFAULT_SOURCE_ADAPTER,
 ) -> list[str]:
-    image_urls = parse_chapter_images(chapter_html, chapter_url)
+    image_urls = source_adapter.parse_chapter_images(chapter_html, chapter_url)
     if image_urls:
         return image_urls
 
@@ -850,7 +1144,7 @@ def resolve_chapter_images(
             if browser_image_urls:
                 return normalize_image_sources(browser_image_urls, chapter_url)
 
-    if not has_reader_markup(chapter_html):
+    if not source_adapter.has_reader_markup(chapter_html):
         detail = f" Browser fallback failed: {browser_error}" if browser_error else ""
         raise RuntimeError(
             "The fetched HTML does not contain manga reader markup. "
@@ -860,13 +1154,6 @@ def resolve_chapter_images(
 
     detail = f" Browser fallback failed: {browser_error}" if browser_error else ""
     raise RuntimeError(f"No images were found in {chapter_url}.{detail}")
-
-
-def first_non_empty(*values: str | None) -> str | None:
-    for value in values:
-        if value and value.strip():
-            return value.strip()
-    return None
 
 
 def print_chapter_overview(chapters: Iterable[Chapter]) -> None:
@@ -1051,26 +1338,39 @@ def build_image_url_candidates(image_url: str) -> list[str]:
     return [image_url]
 
 
+def build_chapter_pdf_path(
+    output_dir: Path,
+    source_adapter: SourceAdapter,
+    series_title: str,
+    chapter: Chapter,
+) -> Path:
+    chapter_folder = output_dir / source_adapter.download_folder / slugify(series_title)
+    pdf_name = f"{slugify(series_title)}-{slugify(chapter.display_name)}.pdf"
+    return chapter_folder / pdf_name
+
+
 def download_chapter_to_pdf(
     session: requests.Session,
     chapter: Chapter,
     series_title: str,
     output_dir: Path,
     browser_image_fetcher: BrowserImageFetcher | None = fetch_chapter_images_with_browser,
+    source_adapter: SourceAdapter = DEFAULT_SOURCE_ADAPTER,
+    html_fetcher: HtmlFetcher = fetch_html,
 ) -> Path:
     print(f"\nDownloading {chapter.display_name} ...")
-    chapter_html = fetch_html(session, chapter.url)
+    chapter_html = html_fetcher(session, chapter.url)
     ensure_not_under_construction(chapter_html)
     image_urls = resolve_chapter_images(
         chapter_html,
         chapter.url,
         browser_image_fetcher=browser_image_fetcher,
+        source_adapter=source_adapter,
     )
 
-    chapter_folder = output_dir / slugify(series_title)
+    pdf_path = build_chapter_pdf_path(output_dir, source_adapter, series_title, chapter)
+    chapter_folder = pdf_path.parent
     chapter_folder.mkdir(parents=True, exist_ok=True)
-    pdf_name = f"{slugify(series_title)}-{slugify(chapter.display_name)}.pdf"
-    pdf_path = chapter_folder / pdf_name
 
     with tempfile.TemporaryDirectory(prefix="manga_snatcher_") as temp_dir:
         temp_path = Path(temp_dir)
@@ -1229,15 +1529,26 @@ def main() -> int:
     )
     parser.add_argument(
         "--browser-cookies",
-        choices=("auto", "brave", "chrome", "chromium", "firefox", "none"),
+        choices=(
+            "auto",
+            "brave",
+            "chrome",
+            "chromium",
+            "edge",
+            "firefox",
+            "opera",
+            "vivaldi",
+            "none",
+        ),
         default="auto",
         help=(
-            "Load mangaread cookies from a local browser profile before fetching chapters "
+            "Load source website cookies from a local browser profile before fetching chapters "
             "(default: auto)."
         ),
     )
     args = parser.parse_args()
 
+    controlled_browser_fetcher = ControlledBrowserHtmlFetcher()
     try:
         try:
             print_update_check_result(check_mangasnatcher_updates())
@@ -1245,17 +1556,29 @@ def main() -> int:
             print(f"Update check: unavailable ({exc})")
 
         input_url = prompt_for_url(args.url)
-        series_url = normalize_series_url(input_url)
+        source_adapter = get_source_adapter(input_url)
+        series_url = source_adapter.normalize_series_url(input_url)
         session = build_session()
-        cookie_source = load_browser_cookies_into_session(session, args.browser_cookies)
+        cookie_source = load_browser_cookies_into_session(
+            session,
+            args.browser_cookies,
+            domain_name=source_adapter.cookie_domain or source_adapter.download_folder,
+        )
         if cookie_source:
             print(f"Loaded browser cookies from: {cookie_source}")
 
+        print(f"Source website: {source_adapter.name} ({source_adapter.download_folder})")
         print(f"Fetching series page: {series_url}")
-        series_html = fetch_html(session, series_url)
+        series_html = fetch_series_html_with_cloudflare_retry(
+            session,
+            series_url,
+            source_adapter,
+            browser_name=args.browser_cookies,
+            interactive_browser_fetcher=controlled_browser_fetcher,
+        )
         ensure_not_under_construction(series_html)
-        series_title = extract_title(series_html, series_url)
-        chapters = parse_chapters(series_html, series_url)
+        series_title = source_adapter.extract_title(series_html, series_url)
+        chapters = source_adapter.parse_chapters(series_html, series_url)
         if not chapters:
             raise RuntimeError("No chapters were found on the series page.")
 
@@ -1265,6 +1588,35 @@ def main() -> int:
 
         browser_image_fetcher = None if args.no_browser_fallback else fetch_chapter_images_with_browser
 
+        def chapter_html_fetcher(active_session, chapter_url):
+            try:
+                return fetch_html(active_session, chapter_url)
+            except CloudflareProtectionError:
+                if controlled_browser_fetcher.is_running:
+                    print(
+                        "Direct chapter request is still protected; "
+                        "loading the chapter through the temporary private Chromium window."
+                    )
+                    return controlled_browser_fetcher(
+                        active_session,
+                        chapter_url,
+                        source_adapter,
+                    )
+
+                print()
+                print(
+                    "This chapter page is protected by Cloudflare or anti-bot checks. "
+                    "MangaSnatcher can load it through a temporary private Chromium window."
+                )
+                answer = input("Open the temporary private Chromium window now? [y/N]: ").strip().lower()
+                if answer not in {"y", "yes", "j", "ja"}:
+                    raise
+                return controlled_browser_fetcher(
+                    active_session,
+                    chapter_url,
+                    source_adapter,
+                )
+
         def chapter_downloader(active_session, chapter, active_series_title, active_output_dir):
             return download_chapter_to_pdf(
                 active_session,
@@ -1272,6 +1624,8 @@ def main() -> int:
                 active_series_title,
                 active_output_dir,
                 browser_image_fetcher=browser_image_fetcher,
+                source_adapter=source_adapter,
+                html_fetcher=chapter_html_fetcher,
             )
 
         result = DownloadRunResult()
@@ -1294,6 +1648,8 @@ def main() -> int:
     except (requests.RequestException, RuntimeError, ValueError) as exc:
         print(f"\nError: {exc}", file=sys.stderr)
         return 1
+    finally:
+        controlled_browser_fetcher.close()
 
 
 if __name__ == "__main__":

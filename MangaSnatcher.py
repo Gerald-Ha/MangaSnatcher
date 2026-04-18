@@ -3,7 +3,6 @@
 Developer: Gerald-H
 GitHub: https://github.com/Gerald-Ha
 Project: MangaSnatcher
-Version: 3.0
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import Callable, Iterable
@@ -74,6 +73,12 @@ class Chapter:
         if self.number is not None:
             return f"Chapter {self.number}"
         return self.title
+
+
+@dataclass
+class DownloadRunResult:
+    successful_chapters: list[Chapter] = field(default_factory=list)
+    failed_chapters: list[Chapter] = field(default_factory=list)
 
 
 def build_session() -> requests.Session:
@@ -742,6 +747,74 @@ def sort_selected_chapters(chapters: list[Chapter]) -> list[Chapter]:
     )
 
 
+def find_skipped_chapter_numbers(chapters: Iterable[Chapter]) -> list[int]:
+    chapter_numbers = sorted(
+        {
+            int(chapter.number)
+            for chapter in chapters
+            if chapter.number is not None
+        }
+    )
+    if len(chapter_numbers) < 2:
+        return []
+
+    present_numbers = set(chapter_numbers)
+    return [
+        chapter_number
+        for chapter_number in range(chapter_numbers[0], chapter_numbers[-1] + 1)
+        if chapter_number not in present_numbers
+    ]
+
+
+def format_skipped_chapter_numbers(chapter_numbers: Iterable[int]) -> str:
+    numbers = list(chapter_numbers)
+    if not numbers:
+        return "None"
+    return ", ".join(str(chapter_number) for chapter_number in numbers)
+
+
+def format_failed_chapters(chapters: Iterable[Chapter]) -> str:
+    failed_chapters = list(chapters)
+    if not failed_chapters:
+        return "None"
+    return ", ".join(chapter.display_name for chapter in failed_chapters)
+
+
+def print_download_summary(
+    chapters: Iterable[Chapter],
+    result: DownloadRunResult,
+) -> None:
+    chapter_list = list(chapters)
+    skipped_chapter_numbers = find_skipped_chapter_numbers(chapter_list)
+
+    print("\n" + "=" * 50)
+    print("DOWNLOAD SUMMARY")
+    print("================")
+    print()
+    print(f"Total chapters found: {len(chapter_list)}")
+    print(f"Downloaded successfully: {len(result.successful_chapters)}")
+    print(f"Failed downloads: {format_failed_chapters(result.failed_chapters)}")
+    print(
+        "Skipped chapter numbers in sequence: "
+        f"{format_skipped_chapter_numbers(skipped_chapter_numbers)}"
+    )
+
+    if skipped_chapter_numbers:
+        print(
+            "Notice: These skipped chapter numbers may simply not exist on the "
+            "source website."
+        )
+
+    if result.failed_chapters:
+        print("Some downloads failed after retrying.")
+    elif not skipped_chapter_numbers:
+        print("Download completed successfully.")
+    else:
+        print("Downloads completed; skipped chapter numbers are informational only.")
+
+    print("=" * 50)
+
+
 def build_image_url_candidates(image_url: str) -> list[str]:
     parsed = urlparse(image_url)
     path = parsed.path
@@ -830,7 +903,10 @@ def download_selected_chapters(
     chapter_downloader=download_chapter_to_pdf,
     retry_waiter=wait_for_retry,
     chapter_waiter=wait_between_chapters,
-) -> None:
+    result: DownloadRunResult | None = None,
+) -> DownloadRunResult:
+    if result is None:
+        result = DownloadRunResult()
     current_cooldown = DEFAULT_CHAPTER_COOLDOWN
 
     for index, chapter in enumerate(chapters):
@@ -840,11 +916,20 @@ def download_selected_chapters(
             print(f"Error while downloading {chapter.display_name}: {exc}")
             retry_waiter(ERROR_RETRY_DELAY, chapter)
             print(f"Retrying {chapter.display_name}...")
-            chapter_downloader(session, chapter, series_title, output_dir)
+            try:
+                chapter_downloader(session, chapter, series_title, output_dir)
+            except (requests.RequestException, RuntimeError, OSError):
+                result.failed_chapters.append(chapter)
+                raise
+            result.successful_chapters.append(chapter)
             current_cooldown = RETRY_CHAPTER_COOLDOWN
+        else:
+            result.successful_chapters.append(chapter)
 
         if len(chapters) > 1 and index < len(chapters) - 1:
             chapter_waiter(current_cooldown)
+
+    return result
 
 
 def download_image(
@@ -980,16 +1065,23 @@ def main() -> int:
                 browser_image_fetcher=browser_image_fetcher,
             )
 
-        download_selected_chapters(
-            session,
-            selected_chapters,
-            series_title,
-            output_dir,
-            chapter_downloader=chapter_downloader,
-        )
+        result = DownloadRunResult()
+        download_error: requests.RequestException | RuntimeError | OSError | None = None
+        try:
+            download_selected_chapters(
+                session,
+                selected_chapters,
+                series_title,
+                output_dir,
+                chapter_downloader=chapter_downloader,
+                result=result,
+            )
+        except (requests.RequestException, RuntimeError, OSError) as exc:
+            download_error = exc
+            print(f"\nError: {exc}", file=sys.stderr)
 
-        print("\nDone.")
-        return 0
+        print_download_summary(chapters, result)
+        return 1 if download_error else 0
     except (requests.RequestException, RuntimeError, ValueError) as exc:
         print(f"\nError: {exc}", file=sys.stderr)
         return 1

@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -33,6 +35,16 @@ from PIL import Image, ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+APP_VERSION = os.environ.get("APP_VERSION", "3.0.5")
+UPDATE_SERVER_URL = os.environ.get(
+    "UPDATE_SERVER_URL",
+    "https://update.gerald-hasani.com",
+)
+UPDATE_PROJECT_ID = os.environ.get("UPDATE_PROJECT_ID", "mangasnatcher")
+UPDATE_CHANNEL = os.environ.get("UPDATE_CHANNEL", "stable")
+UPDATE_API_KEY_ENV_NAMES = ("MANGASNATCHER_UPDATE_API_KEY", "UPDATE_API_KEY")
+DEFAULT_UPDATE_API_KEY = "upd_f75197c5cce29eac237ae3024d15375ba18cba751d061a9e573daa328a31792b"
+UPDATE_CHECK_TIMEOUT = 5
 DEFAULT_TIMEOUT = 30
 DEFAULT_CHAPTER_COOLDOWN = 3
 RETRY_CHAPTER_COOLDOWN = 8
@@ -81,6 +93,19 @@ class DownloadRunResult:
     failed_chapters: list[Chapter] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class UpdateCheckResult:
+    status: str
+    current_version: str
+    latest_version: str | None = None
+    minimum_supported: str | None = None
+    critical: bool | None = None
+    released_at: str | None = None
+    update_link: str | None = None
+    notes_url: str | None = None
+    message: str | None = None
+
+
 def build_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(
@@ -94,6 +119,185 @@ def build_session() -> requests.Session:
         }
     )
     return session
+
+
+def get_update_api_key() -> str | None:
+    for env_name in UPDATE_API_KEY_ENV_NAMES:
+        api_key = os.environ.get(env_name)
+        if api_key:
+            return api_key
+    return DEFAULT_UPDATE_API_KEY
+
+
+def remove_none_values(value):
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            cleaned_item = remove_none_values(item)
+            if cleaned_item is not None:
+                cleaned[key] = cleaned_item
+        return cleaned
+    if isinstance(value, list):
+        return [item for item in (remove_none_values(item) for item in value) if item is not None]
+    return value
+
+
+def build_update_check_payload(
+    project_id: str,
+    current_version: str,
+    channel: str,
+) -> dict:
+    return remove_none_values({
+        "project": {
+            "id": project_id,
+            "instance_id": str(uuid.uuid4()),
+        },
+        "current": {
+            "version": current_version,
+            "build": os.environ.get("BUILD_NUMBER"),
+            "commit": os.environ.get("GIT_COMMIT"),
+            "image_digest": os.environ.get("DOCKER_IMAGE_DIGEST"),
+        },
+        "channel": channel,
+        "platform": {
+            "os": platform.system().lower(),
+            "distro": platform.platform(),
+            "arch": platform.machine(),
+            "container": os.environ.get("DOCKER_CONTAINER"),
+        },
+        "capabilities": {
+            "accept_prerelease": False,
+            "supports_delta": False,
+        },
+    })
+
+
+def parse_update_check_response(data: dict, current_version: str) -> UpdateCheckResult:
+    update_info = data.get("update") if isinstance(data.get("update"), dict) else {}
+    current_info = data.get("current") if isinstance(data.get("current"), dict) else {}
+    return UpdateCheckResult(
+        status=str(data.get("status") or "unknown"),
+        current_version=str(current_info.get("version") or current_version),
+        latest_version=update_info.get("latest_version"),
+        minimum_supported=update_info.get("minimum_supported"),
+        critical=update_info.get("critical"),
+        released_at=update_info.get("released_at"),
+        update_link=update_info.get("update_link"),
+        notes_url=update_info.get("notes_url"),
+        message=data.get("message") or update_info.get("message"),
+    )
+
+
+def check_for_updates(
+    api_key: str,
+    project_id: str = UPDATE_PROJECT_ID,
+    current_version: str = APP_VERSION,
+    update_server_url: str = UPDATE_SERVER_URL,
+    channel: str = UPDATE_CHANNEL,
+    request_post: Callable[..., requests.Response] = requests.post,
+) -> UpdateCheckResult:
+    endpoint = f"{update_server_url.rstrip('/')}/api/updates/v1/updates/check"
+    payload = build_update_check_payload(project_id, current_version, channel)
+    request_id = str(uuid.uuid4())
+
+    try:
+        response = request_post(
+            endpoint,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "X-Request-ID": request_id,
+            },
+            timeout=UPDATE_CHECK_TIMEOUT,
+        )
+        response_data = response.json()
+        response.raise_for_status()
+        return parse_update_check_response(response_data, current_version)
+    except requests.HTTPError as exc:
+        response = exc.response
+        response_data = {}
+        if response is not None:
+            try:
+                response_data = response.json()
+            except ValueError:
+                response_data = {}
+        message = response_data.get("message") or str(exc)
+        status = str(response_data.get("status") or "error")
+        if status == "unknown_project":
+            status = "unknown"
+        return UpdateCheckResult(
+            status=status,
+            current_version=current_version,
+            message=message,
+        )
+    except (requests.RequestException, ValueError) as exc:
+        return UpdateCheckResult(
+            status="error",
+            current_version=current_version,
+            message=str(exc),
+        )
+
+
+def check_mangasnatcher_updates() -> UpdateCheckResult:
+    api_key = get_update_api_key()
+    if not api_key:
+        return UpdateCheckResult(
+            status="skipped",
+            current_version=APP_VERSION,
+            message=(
+                "No update API key configured. Set MANGASNATCHER_UPDATE_API_KEY "
+                "or UPDATE_API_KEY to enable startup update checks."
+            ),
+        )
+
+    return check_for_updates(
+        api_key=api_key,
+        project_id=UPDATE_PROJECT_ID,
+        current_version=APP_VERSION,
+        update_server_url=UPDATE_SERVER_URL,
+        channel=UPDATE_CHANNEL,
+    )
+
+
+def print_update_check_result(result: UpdateCheckResult) -> None:
+    if result.status == "up_to_date":
+        print(f"Update check: MangaSnatcher is up to date (version {result.current_version}).")
+        return
+
+    if result.status == "update_available":
+        latest = result.latest_version or "unknown"
+        print(
+            "Update available: "
+            f"MangaSnatcher {latest} is available "
+            f"(installed: {result.current_version})."
+        )
+        if result.critical:
+            print("This update is marked as critical.")
+        if result.update_link:
+            print(f"Update link: {result.update_link}")
+        if result.notes_url:
+            print(f"Release notes: {result.notes_url}")
+        return
+
+    if result.status == "blocked":
+        latest = result.latest_version or "unknown"
+        minimum = result.minimum_supported or "unknown"
+        print(
+            "Update required: "
+            f"MangaSnatcher {result.current_version} is no longer supported. "
+            f"Latest version: {latest}. Minimum supported: {minimum}."
+        )
+        if result.message:
+            print(result.message)
+        return
+
+    if result.status == "skipped":
+        print(f"Update check: skipped ({result.message})")
+        return
+
+    detail = f" ({result.message})" if result.message else ""
+    print(f"Update check: unavailable{detail}")
 
 
 def normalize_url(url: str) -> str:
@@ -1035,6 +1239,11 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        try:
+            print_update_check_result(check_mangasnatcher_updates())
+        except Exception as exc:
+            print(f"Update check: unavailable ({exc})")
+
         input_url = prompt_for_url(args.url)
         series_url = normalize_series_url(input_url)
         session = build_session()

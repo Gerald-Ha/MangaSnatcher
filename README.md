@@ -106,6 +106,30 @@ python MangaSnatcher.py "https://www.mangaread.org/manga/example-series/" --brow
 
 Supported values are `auto`, `brave`, `chrome`, `chromium`, `firefox`, and `none`.
 
+## Startup Update Check
+
+MangaSnatcher can check your Update Center at startup and print whether the
+installed version is current or whether an update is available.
+
+Register the project in the Update Center with the project ID `mangasnatcher`,
+then start the downloader:
+
+```bash
+python MangaSnatcher.py "https://www.mangaread.org/manga/example-series/"
+```
+
+Optional environment variables:
+
+- `MANGASNATCHER_UPDATE_API_KEY` overrides the built-in MangaSnatcher update API key
+- `UPDATE_SERVER_URL` defaults to `https://update.gerald-hasani.com`
+- `UPDATE_PROJECT_ID` defaults to `mangasnatcher`
+- `UPDATE_CHANNEL` defaults to `stable`
+- `APP_VERSION` defaults to `3.0.5`
+- `BUILD_NUMBER`, `GIT_COMMIT`, and `DOCKER_IMAGE_DIGEST` are sent when present
+
+If the update server is unreachable, MangaSnatcher prints a short notice and
+continues normally.
+
 ## How It Works
 
 1. MangaSnatcher loads the provided series or chapter URL.
